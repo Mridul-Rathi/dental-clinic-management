@@ -1,0 +1,214 @@
+import { PaymentMode, PaymentType } from "@prisma/client"
+import { Decimal } from "@prisma/client/runtime/library"
+import { paymentRepository } from "@/server/repositories/payment.repository"
+import { settingsRepository } from "@/server/repositories/settings.repository"
+import { settingNumber } from "@/lib/settings-value"
+import { createAuditLog } from "@/lib/audit"
+import { prisma } from "@/lib/prisma"
+import { z } from "zod"
+
+export const createPaymentSchema = z.discriminatedUnion("paymentType", [
+  z.object({
+    paymentType: z.literal("CONSULTATION"),
+    visitId: z.string().uuid().optional(),
+    estimateId: z.undefined().optional(),
+    patientId: z.string().uuid(),
+    branchId: z.string().uuid(),
+    amount: z.number().positive(),
+    mode: z.enum(["CASH", "UPI", "CARD", "BANK_TRANSFER"]),
+    transactionRef: z.string().max(100).optional(),
+    notes: z.string().max(500).optional(),
+  }),
+  z.object({
+    paymentType: z.enum(["TREATMENT", "ADVANCE"]),
+    estimateId: z.string().uuid(),
+    visitId: z.string().uuid().optional(),
+    patientId: z.string().uuid(),
+    branchId: z.string().uuid(),
+    amount: z.number().positive(),
+    mode: z.enum(["CASH", "UPI", "CARD", "BANK_TRANSFER"]),
+    transactionRef: z.string().max(100).optional(),
+    notes: z.string().max(500).optional(),
+  }),
+  z.object({
+    paymentType: z.literal("ADJUSTMENT"),
+    estimateId: z.string().uuid().optional(),
+    visitId: z.string().uuid().optional(),
+    patientId: z.string().uuid(),
+    branchId: z.string().uuid(),
+    amount: z.number().positive(),
+    mode: z.enum(["CASH", "UPI", "CARD", "BANK_TRANSFER"]),
+    transactionRef: z.string().max(100).optional(),
+    notes: z.string().min(1, "Reason required for adjustments"),
+  }),
+  // Non-treatment items (X-ray, lab, supplies) — stands alone, no estimate.
+  z.object({
+    paymentType: z.literal("PRODUCT"),
+    estimateId: z.undefined().optional(),
+    visitId: z.string().uuid().optional(),
+    patientId: z.string().uuid(),
+    branchId: z.string().uuid(),
+    amount: z.number().positive(),
+    mode: z.enum(["CASH", "UPI", "CARD", "BANK_TRANSFER"]),
+    transactionRef: z.string().max(100).optional(),
+    notes: z.string().max(500).optional(),
+  }),
+])
+
+export type CreatePaymentInput = z.infer<typeof createPaymentSchema>
+
+async function generateNextReceiptNo(): Promise<string> {
+  const year = new Date().getFullYear()
+  const latest = await paymentRepository.getLatestReceiptNoForYear(year)
+  const next = latest ? parseInt(latest.split("-")[2]) + 1 : 1
+  return `RCP-${year}-${String(next).padStart(5, "0")}`
+}
+
+export const paymentService = {
+  async getByPatient(patientId: string) {
+    return paymentRepository.findByPatient(patientId)
+  },
+
+  /**
+   * Most that can still be collected against an estimate.
+   * - Legacy estimate: its quoted total is owed → total − paid.
+   * - Quote-only estimate: an advance is allowed before anything is billed, up to
+   *   the top of the quoted range (or what's been invoiced, if that's higher).
+   */
+  async getOutstandingByEstimate(estimateId: string) {
+    const est = await prisma.estimate.findUnique({
+      where: { id: estimateId },
+      select: { invoiceBilling: true, total: true, totalMax: true, invoicedTotal: true },
+    })
+    if (!est) return 0
+    const payments = await paymentRepository.findByEstimate(estimateId)
+    const paid = payments.reduce((sum, p) => sum + Number(p.amount), 0)
+    const cap = est.invoiceBilling
+      ? Math.max(Number(est.totalMax ?? est.total), Number(est.invoicedTotal))
+      : Number(est.total)
+    return Math.max(0, cap - paid)
+  },
+
+  async create(input: CreatePaymentInput, collectedById: string, opts?: { paymentDate?: Date }) {
+    // Ledger guard, enforced here rather than in the caller: the reception form
+    // checked the outstanding balance but POST /api/payments did not, so the API
+    // happily booked ₹5,00,000 against an ₹8,000 estimate. Every write path goes
+    // through this method, so the rule belongs here.
+    if (input.paymentType === "TREATMENT" || input.paymentType === "ADVANCE") {
+      const estimate = await prisma.estimate.findUnique({
+        where: { id: input.estimateId },
+        select: { total: true, isDeleted: true, patientId: true },
+      })
+      if (!estimate || estimate.isDeleted) throw new Error("Estimate not found")
+      if (estimate.patientId !== input.patientId) throw new Error("Estimate does not belong to this patient")
+      const outstanding = await this.getOutstandingByEstimate(input.estimateId)
+      // Tolerance absorbs rounding on percentage-split instalments.
+      if (input.amount > outstanding + 0.01) {
+        throw new Error(
+          `Amount (₹${input.amount.toFixed(2)}) exceeds the outstanding balance (₹${outstanding.toFixed(2)}).`
+        )
+      }
+    }
+
+    if (input.visitId) {
+      const visit = await prisma.patientVisit.findUnique({ where: { id: input.visitId }, select: { patientId: true } })
+      if (!visit || visit.patientId !== input.patientId) throw new Error("Visit does not belong to this patient")
+    }
+
+    const receiptNo = await generateNextReceiptNo()
+
+    const { payment, receipt } = await paymentRepository.createWithReceiptAndAccounting({
+      paymentType: input.paymentType as PaymentType,
+      estimateId: "estimateId" in input ? input.estimateId : undefined,
+      visitId: input.visitId,
+      patientId: input.patientId,
+      branchId: input.branchId,
+      amount: new Decimal(input.amount),
+      mode: input.mode as PaymentMode,
+      transactionRef: input.transactionRef,
+      notes: input.notes,
+      collectedById,
+      receiptNo,
+      issuedById: collectedById,
+      paymentDate: opts?.paymentDate,
+    })
+
+    await createAuditLog({
+      entityType: "Payment",
+      entityId: payment.id,
+      action: "CREATE",
+      changedById: collectedById,
+      newValues: {
+        paymentType: input.paymentType,
+        amount: input.amount,
+        mode: input.mode,
+        receiptNo,
+      },
+      branchId: input.branchId,
+    })
+
+    // Treatment/advance payment collected after the doctor is done → the visit is
+    // over, so auto-complete the queue entry (otherwise it stays stuck at
+    // ESTIMATE_CREATED and blocks re-queueing the patient). Consultation payments
+    // happen mid-visit (WAITING/WITH_DOCTOR) and are deliberately excluded.
+    if (input.paymentType === "TREATMENT" || input.paymentType === "ADVANCE") {
+      try {
+        const visitId =
+          input.visitId ??
+          (await prisma.estimate.findUnique({ where: { id: input.estimateId }, select: { visitId: true } }))?.visitId
+        if (visitId) {
+          const entry = await prisma.queueEntry.findUnique({ where: { visitId }, select: { id: true, status: true } })
+          if (entry && (entry.status === "ESTIMATE_CREATED" || entry.status === "PAYMENT_PENDING")) {
+            const { queueService } = await import("@/server/services/queue.service")
+            await queueService.updateStatus(entry.id, "COMPLETED", collectedById)
+          }
+        }
+      } catch {
+        // non-fatal — reception can still complete/cancel the entry manually
+      }
+    }
+
+    // WhatsApp trigger — the ONLY automatic entry point into messaging.
+    // Fires only after a real payment (consultation gate), never on
+    // registration/intake. Non-fatal: messaging must never block payments.
+    try {
+      const { whatsappService } = await import("@/server/services/whatsapp/whatsapp.service")
+      await whatsappService.onPaymentCollected(payment.id)
+    } catch {
+      // queue/logs surface delivery problems — payment flow is unaffected
+    }
+
+    // Qualify a referral on the referee's first payment. Non-fatal.
+    try {
+      const { referralService } = await import("@/server/services/referral.service")
+      await referralService.qualifyForPayment({ id: payment.id, patientId: payment.patientId })
+    } catch {
+      // referral qualification must never block a payment
+    }
+
+    return { payment, receipt }
+  },
+
+  async softDelete(id: string, deletedById: string, deletionReason: string) {
+    const payment = await paymentRepository.findById(id)
+    if (!payment) throw new Error("Payment not found")
+
+    await paymentRepository.softDelete(id, deletedById, deletionReason)
+
+    await createAuditLog({
+      entityType: "Payment",
+      entityId: id,
+      action: "DELETE",
+      changedById: deletedById,
+      previousValues: { amount: Number(payment.amount), paymentType: payment.paymentType },
+      reason: deletionReason,
+    })
+  },
+
+  async getConsultationFee(branchId: string): Promise<number> {
+    // A blank/garbled setting used to return NaN here too, which would have
+    // shown "₹NaN" on the collect-payment screen.
+    const fee = await settingsRepository.get("consultation_fee", branchId)
+    return settingNumber(fee, 1000)
+  },
+}

@@ -1,0 +1,19 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "outputDirectory": ".next",
+  "regions": [
+    "bom1"
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily",
+      "schedule": "30 15 * * *"
+    },
+    {
+      "path": "/api/cron/backup",
+      "schedule": "0 20 * * *"
+    }
+  ]
+}

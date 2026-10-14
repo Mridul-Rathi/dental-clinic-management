@@ -1,0 +1,188 @@
+import { notFound } from "next/navigation"
+import Link from "next/link"
+import { requireSession } from "@/lib/auth"
+import { prisma } from "@/lib/prisma"
+import { patientRepository } from "@/server/repositories/patient.repository"
+import { dentalHistoryRepository } from "@/server/repositories/dental-history.repository"
+import { HealthAlertBadges } from "@/components/patients/HealthAlertBadges"
+import { EditPatientDialog } from "@/components/patients/EditPatientDialog"
+import { ReferAndEarnButton } from "@/components/referrals/ReferAndEarnButton"
+import { ProfileTabs } from "@/components/patients/ProfileTabs"
+import { BRAND_COLORS } from "@/lib/constants"
+import { formatDate, formatCurrency } from "@/lib/utils"
+import { getPatientBalance, getPatientTabCounts } from "@/server/services/patient-summary.service"
+import { formatAge, isUnknownDob } from "@/lib/patient-dob"
+import { ChevronRight } from "lucide-react"
+
+type Props = {
+  children: React.ReactNode
+  params: Promise<{ patientId: string }>
+}
+
+const GENDER_LABELS: Record<string, string> = {
+  MALE: "Male",
+  FEMALE: "Female",
+  OTHER: "Other",
+}
+
+export default async function PatientProfileLayout({ children, params }: Props) {
+  const session = await requireSession()
+  const { patientId } = await params
+
+  const [patient, dentalHistory, branches, balance, tabCounts] = await Promise.all([
+    patientRepository.findById(patientId),
+    dentalHistoryRepository.findLatestByPatient(patientId),
+    prisma.branch.findMany({ where: { isActive: true }, select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    getPatientBalance(patientId),
+    getPatientTabCounts(patientId),
+  ])
+
+  if (!patient) notFound()
+
+  const age = formatAge(patient.dateOfBirth)
+
+  return (
+    <div className="space-y-0">
+      {/* Breadcrumb */}
+      <nav
+        className="flex items-center gap-1.5 text-sm mb-4"
+        style={{ color: BRAND_COLORS.borderDivider }}
+      >
+        <Link href="/patients" className="hover:underline" style={{ color: BRAND_COLORS.primaryTeal }}>
+          Patients
+        </Link>
+        <ChevronRight className="h-3.5 w-3.5" />
+        <span>{patient.fullName}</span>
+      </nav>
+
+      {/* Profile Header Card */}
+      <div className="bg-white rounded-xl border border-[#E0E3E5] overflow-hidden shadow-sm">
+        {/* Top teal bar */}
+        <div className="h-1.5" style={{ backgroundColor: BRAND_COLORS.primaryTeal }} />
+
+        <div className="px-6 py-5">
+          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+            {/* Left — name + ID + demographics */}
+            <div className="flex items-start gap-4">
+              {/* Avatar */}
+              <div
+                className="h-14 w-14 rounded-full flex items-center justify-center text-white text-xl font-bold flex-shrink-0"
+                style={{ backgroundColor: BRAND_COLORS.primaryTeal }}
+              >
+                {patient.fullName.charAt(0).toUpperCase()}
+              </div>
+
+              <div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <h1 className="text-2xl font-semibold tracking-tight" style={{ color: BRAND_COLORS.bodyText }}>
+                    {patient.fullName}
+                  </h1>
+                  <span
+                    className="text-xs font-mono px-2 py-0.5 rounded"
+                    style={{
+                      backgroundColor: `${BRAND_COLORS.primaryTeal}1A`,
+                      color: BRAND_COLORS.primaryTeal,
+                    }}
+                  >
+                    {patient.patientId}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 mt-1.5">
+                  <span className="text-sm" style={{ color: BRAND_COLORS.bodyText }}>
+                    {GENDER_LABELS[patient.gender]} · {age === "—" ? "age —" : `${age} yrs`}
+                  </span>
+                  {isUnknownDob(patient.dateOfBirth) ? (
+                    // Stub created by an online booking — nudge reception to finish it
+                    <span
+                      className="text-xs font-semibold px-2 py-0.5 rounded-full"
+                      style={{ backgroundColor: "#FEF3C7", color: "#92400E" }}
+                    >
+                      Profile incomplete — add date of birth &amp; gender
+                    </span>
+                  ) : (
+                    <span className="text-sm" style={{ color: BRAND_COLORS.borderDivider }}>
+                      DOB: {formatDate(patient.dateOfBirth)}
+                    </span>
+                  )}
+                  <span className="text-sm" style={{ color: BRAND_COLORS.bodyText }}>
+                    📱 {patient.mobile}
+                  </span>
+                  {patient.email && (
+                    <span className="text-sm" style={{ color: BRAND_COLORS.borderDivider }}>
+                      ✉ {patient.email}
+                    </span>
+                  )}
+                </div>
+
+                <div className="mt-1.5">
+                  <span className="text-xs" style={{ color: BRAND_COLORS.borderDivider }}>
+                    Registered: {patient.registrationBranch.name} Branch · {formatDate(patient.createdAt)}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Right — health alerts + profile actions */}
+            <div className="md:text-right space-y-2">
+              {/* Outstanding sits in the header so it stays visible on every tab,
+                  not just Overview — it is the thing reception asks for first. */}
+              <div className="flex md:justify-end items-center gap-4">
+                <div className="text-right">
+                  <p className="text-[11px] uppercase tracking-wide" style={{ color: BRAND_COLORS.borderDivider }}>Billed</p>
+                  <p className="text-sm font-semibold" style={{ color: BRAND_COLORS.bodyText }}>{formatCurrency(balance.estimated)}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-[11px] uppercase tracking-wide" style={{ color: BRAND_COLORS.borderDivider }}>Balance</p>
+                  <p
+                    className="text-sm font-bold"
+                    style={{ color: balance.outstanding > 0 ? "#C2410C" : BRAND_COLORS.secondaryGreen }}
+                  >
+                    {formatCurrency(balance.outstanding)}
+                  </p>
+                </div>
+                {balance.credit > 0 && (
+                  <div className="text-right">
+                    <p className="text-[11px] uppercase tracking-wide" style={{ color: BRAND_COLORS.borderDivider }}>Advance</p>
+                    <p className="text-sm font-bold" style={{ color: BRAND_COLORS.secondaryGreen }} title="Paid ahead — used up by future treatment invoices">
+                      {formatCurrency(balance.credit)}
+                    </p>
+                  </div>
+                )}
+              </div>
+              <HealthAlertBadges history={dentalHistory as any} />
+              {(session.role === "ADMIN" || session.role === "RECEPTIONIST") && (
+                <div className="flex md:justify-end items-center gap-2">
+                  <ReferAndEarnButton patientId={patient.id} patientName={patient.fullName} />
+                  <EditPatientDialog
+                    patient={{
+                      id: patient.id,
+                      fullName: patient.fullName,
+                      dateOfBirth: patient.dateOfBirth.toISOString(),
+                      gender: patient.gender,
+                      mobile: patient.mobile,
+                      email: patient.email,
+                      address: patient.address,
+                      leadSource: patient.leadSource,
+                      referenceName: patient.referenceName,
+                      reasonForVisit: patient.reasonForVisit,
+                      registrationBranchId: patient.registrationBranchId,
+                    }}
+                    branches={branches}
+                    canDelete={session.role === "ADMIN"}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Tab navigation */}
+        <ProfileTabs patientId={patientId} counts={tabCounts} />
+      </div>
+
+      {/* Tab content */}
+      <div className="mt-4">{children}</div>
+    </div>
+  )
+}

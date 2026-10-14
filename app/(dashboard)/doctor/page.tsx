@@ -1,0 +1,148 @@
+import { Metadata } from "next"
+import { requireRole } from "@/lib/auth"
+import { queueRepository } from "@/server/repositories/queue.repository"
+import { estimateRepository } from "@/server/repositories/estimate.repository"
+import { settingsRepository } from "@/server/repositories/settings.repository"
+import { prisma } from "@/lib/prisma"
+import { QueueEntryCard } from "@/components/queue/QueueEntryCard"
+import { BranchSwitcher } from "@/components/shared/BranchSwitcher"
+import { BRAND_COLORS } from "@/lib/constants"
+import { Stethoscope, Users } from "lucide-react"
+import { RefreshButton } from "@/components/shared/RefreshButton"
+import { AutoRefresh } from "@/components/shared/AutoRefresh"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+
+export const metadata: Metadata = { title: "Doctor Queue" }
+export const dynamic = "force-dynamic"
+
+export default async function DoctorPage() {
+  const session = await requireRole(["DOCTOR", "ADMIN"])
+
+  const today = new Date()
+  const assignmentMode = await settingsRepository.get("queue_assignment_mode", session.branchId)
+  const isNextAvailable = assignmentMode === "NEXT_AVAILABLE_DOCTOR"
+
+  const [myQueue, unclaimedQueue, branches] = await Promise.all([
+    queueRepository.findByDoctorAndDate(session.userId, today),
+    isNextAvailable
+      ? queueRepository.findWaitingForNextAvailable(session.branchId)
+      : Promise.resolve([]),
+    prisma.branch.findMany({ where: { isActive: true }, select: { id: true, name: true }, orderBy: { name: "asc" } }),
+  ])
+
+  const active = myQueue.filter((e: { status: string }) =>
+    ["WAITING", "WITH_DOCTOR", "ESTIMATE_CREATED"].includes(e.status)
+  )
+  const completed = myQueue.filter((e: { status: string }) => ["COMPLETED", "CANCELLED"].includes(e.status))
+
+  // Fetch pending treatment items for TREATMENT_SESSION entries currently with the doctor
+  const treatmentPatientIds = [
+    ...new Set(
+      (myQueue as any[])
+        .filter((e) => e.visit?.visitType === "TREATMENT_SESSION" && ["WAITING", "WITH_DOCTOR"].includes(e.status))
+        .map((e) => e.patientId as string)
+    ),
+  ]
+  const pendingItems = await estimateRepository.findPendingItemsByPatients(treatmentPatientIds)
+  const itemsByPatient = pendingItems.reduce<Record<string, typeof pendingItems>>((acc, item) => {
+    const pid = (item as any).estimate.patientId
+    ;(acc[pid] ??= []).push(item)
+    return acc
+  }, {})
+
+  return (
+    <div className="space-y-5">
+      <AutoRefresh />
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight" style={{ color: BRAND_COLORS.bodyText }}>
+            My Patients
+          </h1>
+          <p className="text-sm mt-0.5" style={{ color: BRAND_COLORS.borderDivider }}>
+            {session.name} ·{" "}
+            {today.toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <BranchSwitcher currentBranchId={session.branchId} branches={branches} />
+          <RefreshButton />
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-3 gap-3">
+        {[
+          { label: "Active", value: active.length, color: BRAND_COLORS.primaryTeal },
+          { label: "Seen Today", value: completed.length, color: BRAND_COLORS.secondaryGreen },
+          { label: "Total Today", value: myQueue.length, color: BRAND_COLORS.borderDivider },
+        ].map((s) => (
+          <Card key={s.label} className="border-[#E0E3E5]">
+            <CardContent className="p-3 text-center">
+              <p className="text-2xl font-bold" style={{ color: s.color }}>{s.value}</p>
+              <p className="text-xs mt-0.5" style={{ color: BRAND_COLORS.borderDivider }}>{s.label}</p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      {/* Unclaimed patients (NEXT_AVAILABLE mode) */}
+      {isNextAvailable && unclaimedQueue.length > 0 && (
+        <Card className="border-[#0077BE]">
+          <CardHeader className="pb-3 border-b" style={{ borderColor: BRAND_COLORS.lightBackground }}>
+            <CardTitle className="text-sm flex items-center gap-2" style={{ color: BRAND_COLORS.primaryTeal }}>
+              <Users className="h-4 w-4" />
+              Waiting — Claim a Patient
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-3 space-y-2">
+            {(unclaimedQueue as any[]).map((entry) => (
+              <QueueEntryCard
+                key={entry.id}
+                entry={entry}
+                role={session.role}
+                currentUserId={session.userId}
+                treatmentItems={itemsByPatient[entry.patientId] ?? []}
+              />
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* My Queue */}
+      <Card className="border-[#E0E3E5]">
+        <CardHeader className="pb-3 border-b" style={{ borderColor: BRAND_COLORS.lightBackground }}>
+          <CardTitle className="text-base flex items-center gap-2" style={{ color: BRAND_COLORS.bodyText }}>
+            <Stethoscope className="h-4 w-4" style={{ color: BRAND_COLORS.primaryTeal }} />
+            My Queue
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="pt-4">
+          {myQueue.length === 0 ? (
+            <div className="text-center py-12">
+              <Stethoscope className="h-10 w-10 mx-auto mb-3" style={{ color: BRAND_COLORS.lightBackground }} />
+              <p className="text-sm font-medium" style={{ color: BRAND_COLORS.bodyText }}>
+                No patients today
+              </p>
+              <p className="text-sm mt-1" style={{ color: BRAND_COLORS.borderDivider }}>
+                Patients added to the queue by reception will appear here.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {(myQueue as any[]).map((entry) => (
+                <QueueEntryCard
+                  key={entry.id}
+                  entry={entry as any}
+                  role={session.role}
+                  currentUserId={session.userId}
+                  treatmentItems={itemsByPatient[entry.patientId] ?? []}
+                />
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
